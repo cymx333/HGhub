@@ -58,6 +58,7 @@ jobs:
         with:
           workspaces: src-tauri -> target
           key: windows-release
+          cache-on-failure: true
 
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
@@ -66,6 +67,7 @@ jobs:
         run: pnpm tauri build --ci --bundles nsis -- --locked
 
       - name: Assemble and verify download packages
+        id: packages
         shell: pwsh
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
@@ -79,6 +81,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $installDir = Join-Path $env:RUNNER_TEMP 'hghub-install-check'
           $installer = (Resolve-Path "artifacts/HGhub_$($env:APP_VERSION)_x64-setup.exe").Path
+          # Tauri patches the bundle-type marker for NSIS and then restores the
+          # original portable binary. Compare installation to the actual payload.
+          $payloadDir = Join-Path $env:RUNNER_TEMP 'hghub-installer-payload'
+          & 7z x $installer "-o$payloadDir" -y
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract the installer payload for verification.' }
+          $payloads = @(Get-ChildItem -LiteralPath $payloadDir -Recurse -File -Filter 'huangguo-client.exe')
+          if ($payloads.Count -ne 1) { throw 'Expected exactly one application in the installer payload.' }
           $setup = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -PassThru
           if (-not $setup.WaitForExit(180000)) {
             Stop-Process -Id $setup.Id -Force -ErrorAction SilentlyContinue
@@ -87,29 +96,35 @@ jobs:
           if ($setup.ExitCode -ne 0) { throw "Installer exited with code $($setup.ExitCode)." }
           $installedApp = Join-Path $installDir 'huangguo-client.exe'
           if (-not (Test-Path -LiteralPath $installedApp -PathType Leaf)) { throw 'Installed application was not found.' }
-          $expected = (Get-FileHash src-tauri/target/release/huangguo-client.exe -Algorithm SHA256).Hash
+          $expected = (Get-FileHash -LiteralPath $payloads[0].FullName -Algorithm SHA256).Hash
           if ((Get-FileHash -LiteralPath $installedApp -Algorithm SHA256).Hash -ne $expected) {
-            throw 'Installed application does not match the built application.'
+            throw 'Installed application does not match the installer payload.'
           }
-          $app = Start-Process -FilePath $installedApp -PassThru
-          try {
-            $deadline = [DateTime]::UtcNow.AddSeconds(30)
-            do {
-              Start-Sleep -Milliseconds 500
+          $portableDir = Join-Path $env:RUNNER_TEMP 'hghub-portable-check'
+          Expand-Archive -LiteralPath "artifacts/HGhub_$($env:APP_VERSION)_x64_portable.zip" -DestinationPath $portableDir
+          foreach ($appPath in @($installedApp, (Join-Path $portableDir 'HGhub.exe'))) {
+            $app = Start-Process -FilePath $appPath -PassThru
+            try {
+              $deadline = [DateTime]::UtcNow.AddSeconds(30)
+              do {
+                Start-Sleep -Milliseconds 500
+                $app.Refresh()
+                if ($app.HasExited) { throw "Application exited before opening its window (code $($app.ExitCode)): $appPath" }
+                if ($app.MainWindowHandle -ne [IntPtr]::Zero) { break }
+              } while ([DateTime]::UtcNow -lt $deadline)
+              if ($app.MainWindowHandle -eq [IntPtr]::Zero) { throw "Application window did not appear within 30 seconds: $appPath" }
+              Start-Sleep -Seconds 3
               $app.Refresh()
-              if ($app.HasExited) { throw "Application exited before opening its window (code $($app.ExitCode))." }
-              if ($app.MainWindowHandle -ne [IntPtr]::Zero) { break }
-            } while ([DateTime]::UtcNow -lt $deadline)
-            if ($app.MainWindowHandle -eq [IntPtr]::Zero) { throw 'Application window did not appear within 30 seconds.' }
-            Start-Sleep -Seconds 3
-            $app.Refresh()
-            if ($app.HasExited) { throw 'Application exited immediately after opening its window.' }
-            Write-Host 'Installer, installed binary hash and application window startup verified.'
-          } finally {
-            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue }
+              if ($app.HasExited) { throw "Application exited immediately after opening its window: $appPath" }
+              Write-Host "Verified application window startup: $appPath"
+            } finally {
+              if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue }
+            }
           }
+          Write-Host 'Installer payload hash, silent installation and both application variants verified.'
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: ${{ !cancelled() && steps.packages.outcome == 'success' }}
         with:
           name: windows-release
           path: artifacts/*
@@ -149,7 +164,7 @@ jobs:
           - 免安装版需要系统已安装 Microsoft Edge WebView2；设置保存在当前 Windows 用户的应用数据目录。
           - \`SHA256SUMS.txt\` 可用于核对安装包、ZIP 和许可证的完整性。
 
-          发布前已完成前端类型检查与构建、Rust release 编译、x64 应用 PE 检查、ZIP 解压校验、安装器静默安装、安装后二进制 SHA-256 比对及应用窗口启动检查。上述检查不包含第三方内容服务的可用性或在线播放测试。
+          发布前已完成前端类型检查与构建、Rust release 编译、x64 应用 PE 检查、ZIP 解压校验、安装器静默安装、安装后二进制与安装器内文件的 SHA-256 比对，以及安装版和免安装版的窗口启动检查。上述检查不包含第三方内容服务的可用性或在线播放测试。
 
           构建源码：[${GITHUB_SHA}](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})。
 
