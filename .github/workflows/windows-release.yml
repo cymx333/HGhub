@@ -1,0 +1,171 @@
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/windows-release.yml
+      - scripts/package-windows.ps1
+      - src-tauri/tauri.windows.conf.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify Windows x64
+    if: github.repository == 'cymx333/HGhub' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $cargo = Get-Content src-tauri/Cargo.toml -Raw
+          $cargoVersion = [regex]::Match($cargo, '(?m)^version = "([^"]+)"$').Groups[1].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+$' -or $version -ne $packageVersion -or $version -ne $cargoVersion) {
+            throw 'Release versions must match in package.json, Cargo.toml and tauri.conf.json.'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - uses: pnpm/action-setup@f53f5227a9e83886ab598c617f3c170fab62f0d3 # v6
+        with:
+          version: 10.34.9
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: src-tauri -> target
+          key: windows-release
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build NSIS installer
+        run: pnpm tauri build --ci --bundles nsis -- --locked
+
+      - name: Assemble and verify download packages
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package-windows.ps1 -Version $env:APP_VERSION
+
+      - name: Verify silent installation and application startup
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installDir = Join-Path $env:RUNNER_TEMP 'hghub-install-check'
+          $installer = (Resolve-Path "artifacts/HGhub_$($env:APP_VERSION)_x64-setup.exe").Path
+          $setup = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -PassThru
+          if (-not $setup.WaitForExit(180000)) {
+            Stop-Process -Id $setup.Id -Force -ErrorAction SilentlyContinue
+            throw 'Silent installation timed out.'
+          }
+          if ($setup.ExitCode -ne 0) { throw "Installer exited with code $($setup.ExitCode)." }
+          $installedApp = Join-Path $installDir 'huangguo-client.exe'
+          if (-not (Test-Path -LiteralPath $installedApp -PathType Leaf)) { throw 'Installed application was not found.' }
+          $expected = (Get-FileHash src-tauri/target/release/huangguo-client.exe -Algorithm SHA256).Hash
+          if ((Get-FileHash -LiteralPath $installedApp -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Installed application does not match the built application.'
+          }
+          $app = Start-Process -FilePath $installedApp -PassThru
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              Start-Sleep -Milliseconds 500
+              $app.Refresh()
+              if ($app.HasExited) { throw "Application exited before opening its window (code $($app.ExitCode))." }
+              if ($app.MainWindowHandle -ne [IntPtr]::Zero) { break }
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if ($app.MainWindowHandle -eq [IntPtr]::Zero) { throw 'Application window did not appear within 30 seconds.' }
+            Start-Sleep -Seconds 3
+            $app.Refresh()
+            if ($app.HasExited) { throw 'Application exited immediately after opening its window.' }
+            Write-Host 'Installer, installed binary hash and application window startup verified.'
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue }
+          }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-release
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish verified Windows downloads
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP_VERSION: ${{ needs.build.outputs.version }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: windows-release
+          path: artifacts
+
+      - name: Verify transferred files
+        working-directory: artifacts
+        run: sha256sum --check SHA256SUMS.txt
+
+      - name: Create release notes
+        run: |
+          cat > release-notes.md <<EOF
+          ## HGhub ${APP_VERSION} · Windows x64
+
+          本版本由 [cymx333/HGhub](https://github.com/cymx333/HGhub) 从本仓库源码构建，是 fork 的 Windows 分发包。
+
+          - **安装版**：下载 \`HGhub_${APP_VERSION}_x64-setup.exe\`，双击安装。
+          - **免安装版**：下载 \`HGhub_${APP_VERSION}_x64_portable.zip\`，完整解压后运行 \`HGhub.exe\`。
+          - 免安装版需要系统已安装 Microsoft Edge WebView2；设置保存在当前 Windows 用户的应用数据目录。
+          - \`SHA256SUMS.txt\` 可用于核对安装包、ZIP 和许可证的完整性。
+
+          发布前已完成前端类型检查与构建、Rust release 编译、x64 应用 PE 检查、ZIP 解压校验、安装器静默安装、安装后二进制 SHA-256 比对及应用窗口启动检查。上述检查不包含第三方内容服务的可用性或在线播放测试。
+
+          构建源码：[${GITHUB_SHA}](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})。
+
+          ### 许可证与来源
+
+          本项目采用 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)，许可证全文随安装包、ZIP 和 Release 附件提供。上游版权声明保持原文：
+
+          Required Notice: Copyright (c) 2026 HGhub contributors (https://github.com/Minireel/HGhub)
+          EOF
+
+      - name: Create draft, upload all files, then publish
+        run: |
+          gh release create "$RELEASE_TAG" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "HGhub $APP_VERSION · Windows x64" \
+            --notes-file release-notes.md \
+            --draft
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
